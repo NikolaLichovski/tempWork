@@ -1,0 +1,286 @@
+\documentclass[12pt,a4paper]{report}
+\usepackage[utf8]{inputenc}
+\usepackage{graphicx}
+\usepackage{url}
+\usepackage{cite}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows.meta,positioning,fit}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+
+\title{Log Anomaly Detection in Distributed Streaming Systems}
+\author{Nikola Lichovski}
+\date{}
+
+
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+
+\chapter{Introduction}
+
+In modern distributed systems, the continuous generation of application and infrastructure logs provides a critical foundation for monitoring, debugging, and performance optimization. However, the sheer volume, velocity, and diversity of log data make manual inspection or traditional rule-based monitoring inefficient and error-prone. As systems scale horizontally and operate across multiple services and nodes, automated methods for detecting abnormal behaviour in log streams become essential.
+
+Log anomaly detection focuses on identifying unusual patterns or events in log data that may indicate failures, performance degradation, or security threats. When combined with streaming and distributed processing technologies such as Apache Kafka, these methods enable near real-time detection and response, ensuring higher system reliability and availability.
+
+This project explores the design and evaluation of a distributed log \\anomaly detection pipeline. The system ingests log data through multiple parallel producers, processes it in real-time using a message broker, and applies anomaly detection algorithms on the consumer side. The results are stored in a database and visualized through a lightweight dashboard. 
+
+The primary objectives are to:
+\begin{itemize}
+  \item Develop a distributed streaming architecture for log data processing and anomaly detection.
+  \item Evaluate the performance of the system under different configurations of producers and consumers.
+  \item Analyze the trade-offs between throughput, latency, and detection accuracy in a parallel environment.
+\end{itemize}
+
+The study aims to contribute to the broader understanding of scalable anomaly detection in parallel and distributed systems, emphasizing how distributed messaging frameworks can be leveraged to improve the responsiveness and reliability of monitoring pipelines.
+
+\chapter{Related Work}
+
+\section{Log Anomaly Detection in Modern Systems}  
+In large-scale distributed systems, log data serves as the primary source of telemetry, capturing runtime events, service interactions, failures, and performance metrics. Logs are characterized by high volume, high velocity, and high variety, which makes manual monitoring or rule-based detection increasingly infeasible. Fu et al. \cite{Fu2009} demonstrated that statistical deviations in unstructured log data could reveal execution anomalies, establishing foundational techniques for automated log analysis. While effective in controlled settings, these approaches struggle with highly dynamic or evolving log streams.  
+
+With the emergence of deep learning, sequence-based models such as LSTM have been applied to log streams, providing better capability to capture temporal dependencies and detect subtle anomalies \cite{Du2017}. Du et al. showed that modeling the sequential patterns of logs allows the detection of abnormal events that do not necessarily deviate in value but in order or context. Sun et al. \cite{Sun2021} extended these ideas to handle unlabeled and highly variable log data, highlighting the need for models that can adapt to evolving distributed system behaviors. These studies collectively underscore the shift from purely statistical to learning-based approaches in modern anomaly detection.
+
+\section{Pipelines for Streaming and Distributed Log Processing}  
+Real-time processing of logs in distributed systems requires robust streaming pipelines capable of parallelism, partitioning, and fault-tolerance. Mayer et al. \cite{Mayer2017} introduced StreamLearner, which demonstrates distributed incremental learning over event streams while maintaining state consistency across multiple nodes. Their work emphasizes the importance of designing pipelines that are both scalable and dynamically adaptable to varying workloads.  
+
+Comparative studies on anomaly detection algorithms in streaming environments \cite{Hasani2020} reveal that detection accuracy, latency, and computational efficiency vary significantly depending on the pipeline design. This shows that the choice of framework and algorithm cannot be separated from architectural considerations. Wu et al. \cite{Wu2021} surveyed log analysis techniques and concluded that integrating adaptive streaming frameworks with anomaly detection pipelines is essential for maintaining reliability under high-throughput conditions. Together, these works highlight that an effective anomaly detection system depends not only on the detection algorithm but also on a well-designed, fault-tolerant streaming pipeline.
+
+\section{Anomaly Detection Techniques for Log Data}  
+Methodologically, log anomaly detection spans statistical techniques, classical machine learning, and deep learning. Statistical methods often rely on outlier detection or dimensionality reduction to identify unusual events \cite{Fu2009}. These methods are computationally efficient but limited in capturing complex patterns. Deep learning approaches, particularly sequence models such as LSTM, have proven effective in modeling temporal dependencies and contextual anomalies \cite{Du2017, Sun2021}. They can detect anomalous sequences that may appear normal when considering individual log entries in isolation.  
+
+Multi-source techniques, as presented by Bogatinovski et al. \cite{Bogatinovski2021}, extend anomaly detection by combining heterogeneous log streams from distributed systems. This approach improves robustness against missing or inconsistent data and can capture correlations across multiple services or nodes. 
+
+\section{Log Anomaly Detection in Distributed / Parallel Settings}  
+Distributed and parallel systems introduce additional challenges: logs may arrive out-of-order, services may produce heterogeneous formats, and system scaling (multiple producers and consumers) can impact detection latency and throughput. Han et al. \cite{Han2023} and Himler et al. \cite{Himler2024} demonstrated that deep learning-based distributed anomaly detection benefits from explicitly modeling the distributed context, leading to improved accuracy and responsiveness.  
+
+Benchmark studies of streaming pipelines \cite{Patel2024} reveal that parallelism and partitioning strategies strongly influence system performance metrics, such as throughput and end-to-end latency. Edge-oriented frameworks such as IDForest \cite{IDForest2022} further illustrate that lightweight, incremental models can detect anomalies in real-time with minimal resource overhead. These findings emphasize that both the detection algorithm and the distributed system design contribute critically to effective log anomaly detection.
+
+\section{Gap Analysis and Positioning of This Work}  
+Despite extensive research, few studies systematically evaluate how varying degrees of parallelism, such as the number of producers, consumer instances, and Kafka partitions, affect detection performance. Most prior works focus either on detection accuracy or model architecture, often neglecting the combined impact on throughput, latency, and system scalability.  
+
+The present work addresses this gap by implementing a distributed streaming pipeline and measuring performance across multiple dimensions. By adjusting producer and consumer counts and observing the resulting effects on latency, throughput, and detection accuracy, this study provides practical insights into the trade-offs inherent in distributed log anomaly detection. Furthermore, it demonstrates how a modular pipeline can be configured to balance system efficiency with detection reliability, offering guidance for both researchers and practitioners designing similar systems.
+
+
+\chapter{Solution Architecture}
+
+\section{Overview}
+
+The goal of this architecture is to design a distributed log anomaly detection pipeline capable of ingesting streaming log data, processing it in real time, identifying anomalous behaviour, and storing both detections and performance metrics for later analysis. The system is planned to be modular and easy to reconfigure, since part of the work involves experimenting with different numbers of producers, consumers, and Kafka partitions. For anomaly detection, the initial approach will rely on an Isolation Forest model, mainly because it works well with high-volume data streams and does not require labelled examples \cite{IDForest2022, Bogatinovski2021}.
+
+\section{High-level workflow}
+
+The pipeline consists of several components that interact through well-defined interfaces: log producers, a Kafka broker, consumer services that carry out feature extraction and anomaly scoring, a relational database for persistence, and a dashboard for real-time monitoring.  
+Figure~\ref{fig:architecture} summarizes the planned data flow.
+
+\begin{enumerate}
+    \item \textbf{Producers} generate or relay structured JSON logs at a configurable rate. Multiple instances can be started to simulate higher input load.
+    \item \textbf{Kafka} acts as the ingestion layer. Producers write logs to partitioned topics, allowing parallel processing \cite{Mayer2017}.
+    \item \textbf{Consumers} subscribe as a consumer group. Each instance extracts simple features from incoming logs and assigns anomaly scores using Isolation Forest.
+    \item \textbf{PostgreSQL} stores both the processed logs and anomaly scores. An additional table is planned for recording run-level performance metrics.
+    \item \textbf{Dashboard (Streamlit)} visualizes throughput, lag, anomaly counts, and other collected metrics.
+    \item \textbf{Orchestration} is handled with Docker Compose, which makes it possible to scale producers and consumers for controlled experiments.
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    comp/.style={draw, rounded corners, fill=white, minimum width=4.2cm, minimum height=1cm, align=center},
+    arrow/.style={->, thick},
+    node distance=1.4cm
+]
+
+% main pipeline
+\node[comp] (producers) {Log Producers};
+\node[comp, below=of producers] (kafka) {Kafka Broker};
+\node[comp, below=of kafka] (consumers) {Consumers \&\\ Anomaly Detection};
+\node[comp, below=of consumers] (database) {PostgreSQL};
+
+% side components (placed tighter, no overflow)
+\node[comp, right=3.2cm of consumers] (metrics) {Metrics Collection};
+\node[comp, below=of metrics] (dashboard) {Streamlit Dashboard};
+
+% arrows (pipeline)
+\draw[arrow] (producers) -- (kafka);
+\draw[arrow] (kafka) -- (consumers);
+\draw[arrow] (consumers) -- (database);
+
+% arrows (metrics + dashboard)
+\draw[arrow] (kafka.east) -- (metrics.west);
+\draw[arrow] (consumers.east) -- (metrics.west);
+\draw[arrow] (metrics) -- (database);
+\draw[arrow] (metrics) -- (dashboard);
+\draw[arrow] (database) -- (dashboard);
+
+\end{tikzpicture}
+\caption{Planned high-level architecture of the log anomaly detection pipeline.}
+\label{fig:architecture}
+\end{figure}
+
+\section{Data Flow}
+
+Alongside the architectural overview, the data-flow diagram ~\ref{fig:dataflow} presents the planned path that each log entry will take through the platform. The process will begin with log creation, continue with structured ingestion into Kafka, then pass through the machine-learning consumer for feature extraction and anomaly scoring. The results will then be inserted into PostgreSQL and displayed on the dashboard. By laying out this future workflow, the diagram shows how the system is expected to operate in practice.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    comp/.style={draw, rounded corners, fill=white, minimum width=4.8cm, minimum height=1.1cm, align=center},
+    arrow/.style={->, thick},
+    node distance=1.3cm
+]
+
+\node[comp] (src) {Log Source};
+\node[comp, below=of src] (prod) {Producer:\\Serialize \& Publish};
+\node[comp, below=of prod] (kfk) {Kafka Topic};
+\node[comp, below=of kfk] (cons) {Consumer:\\Parse, Extract Features,\\Isolation Forest};
+\node[comp, below=of cons] (db) {PostgreSQL};
+\node[comp, below=of db] (dash) {Dashboard Query};
+
+\draw[arrow] (src) -- (prod);
+\draw[arrow] (prod) -- (kfk);
+\draw[arrow] (kfk) -- (cons);
+\draw[arrow] (cons) -- (db);
+\draw[arrow] (db) -- (dash);
+
+\end{tikzpicture}
+\caption{Data-flow diagram of the planned anomaly detection pipeline.}
+\label{fig:dataflow}
+\end{figure}
+
+\section{Component descriptions}
+
+\subsection{Producers}
+
+The producers will be small processes that emit JSON log entries at a controllable rate. They can either simulate synthetic logs or forward existing ones. Being able to run multiple producer instances makes it possible to test different ingestion intensities and observe how the rest of the pipeline scales.
+
+\subsection{Kafka}
+
+Kafka provides a reliable ingestion buffer. Logs are written to one or more topics, and each topic may be divided into several partitions. Partitioning is important because it defines the available parallelism on the consumer side. Kafka also handles message retention, ordering within partitions, and offset tracking, which helps in running repeatable experiments \cite{Mayer2017}.
+
+\subsection{Consumers and anomaly detection}
+
+Consumers subscribe as a group, and Kafka distributes partitions among them. Each consumer will perform the following steps:
+
+\begin{enumerate}
+    \item \textbf{Parsing:} Normalizing the incoming JSON log.
+    \item \textbf{Feature extraction:} Computing simple numeric and categorical features that can be processed efficiently.
+    \item \textbf{Anomaly scoring:} Using an Isolation Forest model to assign a score to each log entry. This approach is suitable for semi-structured logs and unsupervised settings \cite{IDForest2022, Bogatinovski2021}.
+    \item \textbf{Storage:} Writing the processed log and its score to PostgreSQL.
+\end{enumerate}
+
+Launching more consumer instances will allow the system to process a larger number of partitions and handle higher throughput.
+
+\subsection{PostgreSQL}
+
+PostgreSQL will serve as the system’s persistent storage. It will keep both the logs and the resulting anomaly scores.  
+A separate table is planned for storing run-level performance metrics so that different configurations (e.g., number of producers, consumer count, topic partitions) can be compared systematically. These metrics will later be used to analyze how system behaviour changes under different loads.
+
+\subsection{Metrics Collection and Dashboard}
+
+A lightweight metrics component will collect runtime statistics from Kafka and the consumers, including:
+
+\begin{itemize}
+    \item producer throughput,
+    \item consumer lag,
+    \item processing rates,
+    \item end-to-end latency,
+    \item anomaly counts.
+\end{itemize}
+
+The metrics will be written to the database and visualized by a Streamlit dashboard. The dashboard will provide both real-time views and historical comparisons, which is important for evaluating different experimental setups.
+
+\subsection{Orchestration and experimentation}
+
+Docker Compose will orchestrate Kafka, PostgreSQL, the dashboard, and any number of producers and consumers.  
+This setup makes it straightforward to run controlled experiments: by adjusting container counts and environment variables, the system can be tested under a variety of workloads and configurations.
+
+\section{Scalability and planned extensions}
+
+The architecture is designed to scale horizontally by simply adding more producers or consumers. Kafka’s partitioning provides a natural parallelism model, and the database schema will support tracking performance across different runs.  
+Future work may include exploring alternative anomaly detection approaches that incorporate temporal patterns or sequence modelling \cite{Du2017, Sun2021}, but the first version will focus on Isolation Forest and feature-based detection.
+
+\chapter{Results}
+
+This chapter presents and analyses the experimental results obtained from the implemented distributed log anomaly detection system. The primary objective of these experiments is to evaluate how different system configurations influence performance under varying levels of load and parallelism. In particular, the experiments examine the impact of scaling producers, consumers, and Kafka partitions on throughput, end-to-end latency, consumer lag, and the number of detected anomalies.
+
+All experiments were executed using identical log generation logic and the same Isolation Forest anomaly detection model. This ensures that observed differences in performance are attributable solely to architectural and configuration changes rather than variations in data or model behaviour. During execution, performance metrics were continuously collected and persisted to the database, enabling systematic comparison across all experimental runs.
+
+\section{Overview of Experiments}
+
+A total of ten experiments were conducted using a batch execution script, each representing a distinct system configuration. These configurations are designed to capture several representative scenarios: baseline operation under minimal load, isolated scaling of producers or consumers, balanced scaling of both components, and high-parallelism stress testing using increased partition counts.
+
+Table~\ref{tab:all-experiments} provides a consolidated overview of all experimental results. The table reports the number of producers (P), consumers (C), and Kafka partitions used in each configuration, along with the total number of processed logs, detected anomalies, average throughput, average end-to-end latency, and maximum observed consumer lag. This overview serves as the basis for the more detailed analysis presented in the following sections.
+
+\begin{table}[htbp]
+\centering
+\caption{Summary of experimental results across all configurations}
+\label{tab:all-experiments}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{lcccccccc}
+\hline
+\textbf{Experiment} & \textbf{P} & \textbf{C} & \textbf{Part.} & \textbf{Logs} & \textbf{Anom.} & \textbf{Throughput} & \textbf{Latency (ms)} & \textbf{Max Lag} \\
+\hline
+baseline-1p-1c-1part & 1 & 1 & 1 & 593 & 48 & 0.99 & 506.80 & 1001 \\
+baseline-1p-1c-3part & 1 & 1 & 3 & 593 & 70 & 0.99 & 506.80 & 1001 \\
+scale-producers-2p   & 2 & 1 & 3 & 1188 & 233 & 1.42 & 595.52 & 1244 \\
+scale-producers-3p   & 3 & 1 & 3 & 1816 & 361 & 2.02 & 493.33 & 1730 \\
+scale-consumers-2c   & 1 & 2 & 3 & 639 & 130 & 1.00 & 506.61 & 2466 \\
+scale-consumers-3c   & 1 & 3 & 3 & 619 & 54 & 1.00 & 506.61 & 2712 \\
+balanced-2p-2c       & 2 & 2 & 3 & 1228 & 157 & 1.52 & 486.69 & 2961 \\
+balanced-3p-3c       & 3 & 3 & 3 & 1851 & 375 & 2.01 & 493.23 & 3459 \\
+high-partitions      & 2 & 2 & 6 & 1210 & 246 & 1.51 & 486.84 & 1009 \\
+stress-test-4p-4c    & 4 & 4 & 6 & 2460 & 512 & 2.48 & 506.48 & 1260 \\
+\hline
+\end{tabular}
+}
+\end{table}
+
+\section{Baseline Behaviour}
+
+The baseline experiments, consisting of a single producer and a single consumer, establish a reference point for system behaviour under minimal load. With one Kafka partition, the system processes a total of 593 log messages, achieving an average throughput of 0.99 logs per second and an average end-to-end latency of approximately 506.8 ms. The maximum observed consumer lag in this configuration is 1001 messages.
+
+Increasing the number of partitions from one to three while keeping the producer and consumer counts unchanged does not lead to measurable changes in throughput or latency, which remain at 0.99 logs per second and 506.8 ms respectively. This outcome is expected, as a single consumer cannot exploit additional partitions for parallel consumption. However, the number of detected anomalies increases from 48 to 70, suggesting that partition-level distribution may influence the temporal ordering or batching of log messages, indirectly affecting anomaly detection outcomes even under low load.
+
+\section{Scaling Producers}
+
+Producer scaling experiments focus on increasing ingestion pressure while maintaining a fixed processing capacity of one consumer. When the number of producers is increased from one to two, the total number of processed logs nearly doubles, rising from 593 to 1188 messages. Correspondingly, throughput increases from 0.99 to 1.42 logs per second. This improvement comes at the cost of increased latency, which rises to approximately 595.5 ms, and increased maximum consumer lag of 1244 messages.
+
+Further increasing the number of producers to three amplifies these effects. The system processes 1816 logs with an average throughput of 2.02 logs per second, more than double the baseline throughput. Interestingly, average latency decreases to approximately 493.3 ms, indicating that batching effects and more continuous data flow may partially offset processing delays. However, maximum lag continues to grow, reaching 1730 messages, highlighting that the single consumer becomes a bottleneck under sustained high ingestion rates. These results demonstrate that producer scaling effectively increases throughput but must be matched with sufficient consumer capacity to prevent backlog accumulation.
+
+\section{Scaling Consumers}
+
+Consumer scaling experiments isolate the effect of increasing processing parallelism while keeping the ingestion rate fixed at one producer. With two consumers and three partitions, the system processes 639 logs with an average throughput of 1.00 log per second and an average latency of approximately 506.6 ms, values that are nearly identical to the baseline configuration.
+
+Increasing the number of consumers to three does not yield further throughput improvements, which remain at 1.00 log per second, nor does it significantly reduce latency. Instead, maximum lag increases from 2466 to 2712 messages. This behaviour suggests that, under low ingestion rates, additional consumers provide limited benefit and may introduce coordination overhead within the Kafka consumer group. These results highlight that consumer scaling alone is insufficient to improve performance unless accompanied by increased input volume or additional partitions.
+
+\section{Balanced Producer--Consumer Scaling}
+
+Balanced configurations scale producers and consumers simultaneously, aiming to maintain equilibrium between ingestion and processing capacity. With two producers and two consumers, the system processes 1228 logs and achieves an average throughput of 1.52 logs per second. Average latency decreases slightly to 486.7 ms, indicating more efficient parallel processing. However, maximum lag increases to 2961 messages, suggesting transient imbalances during peak ingestion periods.
+
+The configuration with three producers and three consumers further improves throughput to 2.01 logs per second while processing 1851 logs. Latency remains stable at approximately 493.2 ms, demonstrating that the system maintains consistent response times even as throughput increases. Although maximum lag rises to 3459 messages, the stability of latency indicates that the system is capable of sustaining higher workloads when producer and consumer scaling are aligned.
+
+\section{High Parallelism and Stress Testing}
+
+The high-partition configuration introduces additional Kafka partitions to increase parallelism at the messaging layer. With two producers, two consumers, and six partitions, the system processes 1210 logs with a throughput of 1.51 logs per second and an average latency of 486.8 ms. Notably, maximum lag decreases significantly to 1009 messages compared to the equivalent three-partition balanced configuration, demonstrating the effectiveness of partition-level parallelism in reducing backlog.
+
+The stress-test configuration represents the most demanding scenario, with four producers, four consumers, and six partitions. This setup processes 2460 logs and achieves the highest observed throughput of 2.48 logs per second. Despite the increased load, average latency remains close to baseline at 506.5 ms, and maximum lag is limited to 1260 messages. These results indicate that the system scales effectively under coordinated increases in producers, consumers, and partitions, maintaining stable latency while significantly increasing throughput.
+
+\section{Summary of Results}
+
+Overall, the experimental results demonstrate that system performance is strongly influenced by the balance between ingestion rate, processing capacity, and Kafka partitioning. Scaling producers alone increases throughput but leads to higher consumer lag, while scaling consumers alone provides minimal benefit under low input rates. Balanced scaling, particularly when combined with increased partition counts, yields the most stable and scalable performance, maintaining low latency while supporting higher throughput. These findings validate the architectural choices presented earlier and confirm the system’s suitability as a controlled experimental platform for distributed log processing and anomaly detection.
+
+
+\chapter{References}
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
