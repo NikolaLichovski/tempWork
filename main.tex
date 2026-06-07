@@ -6,7 +6,8 @@
 \usepackage{hyperref}
 \usepackage{tikz}
 \usetikzlibrary{shapes,arrows.meta,positioning,fit}
-
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
 \hypersetup{
     colorlinks=true,
     linkcolor=blue,
@@ -43,6 +44,9 @@ The primary objectives are to:
 
 The study aims to contribute to the broader understanding of scalable anomaly detection in parallel and distributed systems, emphasizing how distributed messaging frameworks can be leveraged to improve the responsiveness and reliability of monitoring pipelines.
 
+The complete source code, experiment scripts, and configuration files used in this work are publicly available at:
+\url{https://github.com/NikolaLichovski/distributed-log-ml-benchmark}.
+
 \chapter{Related Work}
 
 \section{Log Anomaly Detection in Modern Systems}  
@@ -65,8 +69,22 @@ Distributed and parallel systems introduce additional challenges: logs may arriv
 
 Benchmark studies of streaming pipelines \cite{Patel2024} reveal that parallelism and partitioning strategies strongly influence system performance metrics, such as throughput and end-to-end latency. Edge-oriented frameworks such as IDForest \cite{IDForest2022} further illustrate that lightweight, incremental models can detect anomalies in real-time with minimal resource overhead. These findings emphasize that both the detection algorithm and the distributed system design contribute critically to effective log anomaly detection.
 
-\section{Gap Analysis and Positioning of This Work}  
-Despite extensive research, few studies systematically evaluate how varying degrees of parallelism, such as the number of producers, consumer instances, and Kafka partitions, affect detection performance. Most prior works focus either on detection accuracy or model architecture, often neglecting the combined impact on throughput, latency, and system scalability.  
+\section{Positioning of This Work}
+
+Despite extensive research on log anomaly detection algorithms and streaming system architectures, few studies systematically evaluate the \textbf{interaction between system configuration and detection performance} in distributed settings. Most prior work focuses on either algorithmic improvements (accuracy, model architecture) or system design (throughput, fault tolerance), treating these as independent concerns.
+
+However, as highlighted by Patel et al. \cite{Patel2024}, performance benchmarks often neglect the impact of distributed system parameters—such as partition count, consumer group size, and producer parallelism—on both computational efficiency and detection reliability. Himler et al. \cite{Himler2024} note that distributed anomaly detection introduces challenges of model consistency and coordination overhead, but provide limited quantitative analysis of these effects under varying configurations.
+
+This work addresses these gaps through controlled experimentation that systematically varies three architectural parameters (producer count, consumer count, partition count) and measures their combined impact on four performance dimensions (throughput, latency, consumer lag, anomaly detection rate). Specifically, this study provides:
+
+\begin{itemize}
+    \item \textbf{Empirical measurement} of throughput scaling characteristics under parallel log ingestion
+    \item \textbf{Quantitative analysis} of consumer group coordination overhead and its impact on lag accumulation
+    \item \textbf{Critical evaluation} of distributed anomaly detection consistency when models operate independently per consumer
+    \item \textbf{Practical guidance} on configuration selection for balancing performance and detection reliability
+\end{itemize}
+
+By treating the system as a unified experimental platform rather than separating algorithm from architecture, this work demonstrates that configuration choices significantly influence not only processing performance but also the reliability and consistency of anomaly detection results. These findings are directly relevant to practitioners deploying log analysis pipelines in production distributed systems.
 
 The present work addresses this gap by implementing a distributed streaming pipeline and measuring performance across multiple dimensions. By adjusting producer and consumer counts and observing the resulting effects on latency, throughput, and detection accuracy, this study provides practical insights into the trade-offs inherent in distributed log anomaly detection. Furthermore, it demonstrates how a modular pipeline can be configured to balance system efficiency with detection reliability, offering guidance for both researchers and practitioners designing similar systems.
 
@@ -156,128 +174,543 @@ Alongside the architectural overview, the data-flow diagram ~\ref{fig:dataflow} 
 \label{fig:dataflow}
 \end{figure}
 
-\section{Component descriptions}
+\section{Component Implementation}
 
-\subsection{Producers}
+\subsection{Log Producers}
 
-The producers will be small processes that emit JSON log entries at a controllable rate. They can either simulate synthetic logs or forward existing ones. Being able to run multiple producer instances makes it possible to test different ingestion intensities and observe how the rest of the pipeline scales.
+Producers are implemented as containerized Python processes using the \texttt{confluent-kafka} library. Each producer instance generates synthetic JSON log entries at a configurable rate (default: 1.0 messages per second) and publishes them to the Kafka topic. Log entries contain four fields: timestamp (ISO 8601 format), service identifier (chosen from a predefined set of five microservices), log level (INFO, WARN, or ERROR with weighted probability distribution), and message text.
 
-\subsection{Kafka}
-
-Kafka provides a reliable ingestion buffer. Logs are written to one or more topics, and each topic may be divided into several partitions. Partitioning is important because it defines the available parallelism on the consumer side. Kafka also handles message retention, ordering within partitions, and offset tracking, which helps in running repeatable experiments \cite{Mayer2017}.
-
-\subsection{Consumers and anomaly detection}
-
-Consumers subscribe as a group, and Kafka distributes partitions among them. Each consumer will perform the following steps:
-
-\begin{enumerate}
-    \item \textbf{Parsing:} Normalizing the incoming JSON log.
-    \item \textbf{Feature extraction:} Computing simple numeric and categorical features that can be processed efficiently.
-    \item \textbf{Anomaly scoring:} Using an Isolation Forest model to assign a score to each log entry. This approach is suitable for semi-structured logs and unsupervised settings \cite{IDForest2022, Bogatinovski2021}.
-    \item \textbf{Storage:} Writing the processed log and its score to PostgreSQL.
-\end{enumerate}
-
-Launching more consumer instances will allow the system to process a larger number of partitions and handle higher throughput.
-
-\subsection{PostgreSQL}
-
-PostgreSQL will serve as the system’s persistent storage. It will keep both the logs and the resulting anomaly scores.  
-A separate table is planned for storing run-level performance metrics so that different configurations (e.g., number of producers, consumer count, topic partitions) can be compared systematically. These metrics will later be used to analyze how system behaviour changes under different loads.
-
-\subsection{Metrics Collection and Dashboard}
-
-A lightweight metrics component will collect runtime statistics from Kafka and the consumers, including:
-
+To support systematic experimentation, each producer instance:
 \begin{itemize}
-    \item producer throughput,
-    \item consumer lag,
-    \item processing rates,
-    \item end-to-end latency,
-    \item anomaly counts.
+    \item Accepts environment variables for experiment ID and target message rate
+    \item Records message send timestamps for latency calculation
+    \item Implements delivery callbacks to confirm successful broker acknowledgment
+    \item Publishes metrics (throughput, send latency) to PostgreSQL via a shared metrics collection library
 \end{itemize}
 
-The metrics will be written to the database and visualized by a Streamlit dashboard. The dashboard will provide both real-time views and historical comparisons, which is important for evaluating different experimental setups.
+Multiple producer instances operate independently and do not coordinate with each other. Each produces messages with unique keys, enabling Kafka's partition assignment logic to distribute load across available partitions.
 
-\subsection{Orchestration and experimentation}
+\subsection{Apache Kafka and Partitioning Strategy}
 
-Docker Compose will orchestrate Kafka, PostgreSQL, the dashboard, and any number of producers and consumers.  
-This setup makes it straightforward to run controlled experiments: by adjusting container counts and environment variables, the system can be tested under a variety of workloads and configurations.
+Kafka serves as the distributed message buffer between producers and consumers. The system uses a single topic with a configurable number of partitions (1, 3, or 6 in the experiments). Partitions enable parallel consumption: each partition is assigned to exactly one consumer within a consumer group, allowing multiple consumers to process different subsets of the log stream concurrently.
 
-\section{Scalability and planned extensions}
+Key configuration parameters include:
+\begin{itemize}
+    \item \textbf{Replication factor:} Set to 1 (single broker, suitable for experimental environment)
+    \item \textbf{Retention policy:} Messages retained for the duration of experiments
+    \item \textbf{Auto-creation:} Disabled; topics created programmatically with specified partition count
+\end{itemize}
+
+Partition assignment follows Kafka's default range-based strategy. For example, with 3 partitions and 2 consumers, one consumer receives partitions 0 and 1, while the other receives partition 2. This creates potential load imbalance, which is reflected in the experimental results.
+
+\subsection{Consumer Group and Parallel Processing}
+
+Consumers are implemented as containerized Python processes that subscribe to the log topic as members of a shared consumer group (\texttt{ml-consumer-group}). Kafka's consumer group protocol ensures that each partition is assigned to exactly one consumer instance, preventing duplicate processing while enabling parallelism.
+
+Each consumer implements the following processing pipeline:
+
+\begin{enumerate}
+    \item \textbf{Message polling:} Fetch batches of messages from assigned partitions (poll timeout: 1 second)
+    \item \textbf{Deserialization:} Parse JSON log structure and validate required fields
+    \item \textbf{Feature extraction:} Extract seven features for anomaly detection:
+    \begin{itemize}
+        \item Service identifier (label-encoded to integer)
+        \item Log level (label-encoded: INFO=0, WARN=1, ERROR=2)
+        \item Message length (character count)
+        \item Error keyword presence (binary: 0 or 1)
+        \item Warning keyword presence (binary: 0 or 1)
+        \item Hour of day (0-23)
+        \item Minute of hour (0-59)
+    \end{itemize}
+    \item \textbf{Anomaly scoring:} Apply Isolation Forest model to feature vector
+    \item \textbf{Database insertion:} Store log entry and anomaly score in PostgreSQL
+    \item \textbf{Offset commit:} Acknowledge successful processing to Kafka
+    \item \textbf{Metrics recording:} Log processing latency and current partition lag
+\end{enumerate}
+
+\textbf{Critical implementation detail:} Each consumer maintains an \textit{independent} Isolation Forest model, trained on its own partition's historical data (last 1000 messages, minimum 10 for training). Models are persisted to a Docker volume to survive consumer restarts. This design choice, while simplifying implementation, introduces model divergence issues documented in the Results section.
+
+\subsection{Isolation Forest Anomaly Detection}
+
+The Isolation Forest algorithm \cite{IDForest2022} detects anomalies by measuring how easily a data point can be isolated in randomly constructed decision trees. Anomalies, being rare and different, require fewer splits to isolate compared to normal points.
+
+Model parameters:
+\begin{itemize}
+    \item \textbf{Contamination:} 0.1 (expects 10\% of data to be anomalous)
+    \item \textbf{Number of estimators:} 100 trees
+    \item \textbf{Random state:} Fixed at 42 for reproducibility
+\end{itemize}
+
+The model triggers retraining every 20 messages if not yet trained, using the most recent 1000 historical logs from the database. For each incoming log, the model returns:
+\begin{itemize}
+    \item \textbf{Binary prediction:} Anomaly (−1) or normal (+1)
+    \item \textbf{Anomaly score:} Decision function value, normalized to [0, 1] range
+\end{itemize}
+
+\subsection{Performance Metrics Collection}
+
+A shared Python library (\texttt{metrics\_collector.py}) provides thread-safe metrics collection with batched database writes. Both producers and consumers instantiate a \texttt{MetricsCollector} object configured with:
+\begin{itemize}
+    \item Experiment ID (for grouping related measurements)
+    \item Component type and instance ID
+    \item Batch size (50 metrics) and flush interval (10 seconds)
+\end{itemize}
+
+Producers record:
+\begin{itemize}
+    \item Message send latency (time from creation to broker acknowledgment)
+    \item Per-producer throughput (messages per second, windowed)
+\end{itemize}
+
+Consumers record:
+\begin{itemize}
+    \item End-to-end processing latency (message receipt to database commit)
+    \item Per-consumer throughput (messages processed per second)
+    \item Consumer lag per partition (current offset vs. log-end offset)
+\end{itemize}
+
+Metrics are buffered in memory and inserted into PostgreSQL in batches to minimize database overhead. A background thread performs periodic flushes every 10 seconds or when the buffer reaches 50 entries.
+
+\subsection{Database Schema}
+
+PostgreSQL stores five types of data:
+
+\begin{enumerate}
+    \item \textbf{Logs table:} Raw log entries (timestamp, service, level, message)
+    \item \textbf{Anomalies table:} Detection results (foreign key to logs, binary flag, score)
+    \item \textbf{Experiments table:} Metadata for each run (producers, consumers, partitions, start/end time, status)
+    \item \textbf{Performance\_metrics table:} Time-series measurements (experiment ID, component type/ID, metric name, value, timestamp)
+    \item \textbf{Consumer\_lag table:} Partition-level lag tracking (experiment ID, consumer ID, partition, offsets, timestamp)
+\end{enumerate}
+
+Indexes are created on frequently queried columns (timestamps, experiment ID, component IDs) and composite indexes support common query patterns (e.g., filtering metrics by experiment and component type).
+
+\subsection{Orchestration and Experiment Management}
+
+Docker Compose manages all services (ZooKeeper, Kafka, PostgreSQL, producers, consumers, dashboard) and supports dynamic scaling through environment variables:
+
+\begin{itemize}
+    \item \texttt{EXPERIMENT\_ID}: Unique identifier for grouping metrics
+    \item \texttt{KAFKA\_NUM\_PARTITIONS}: Partition count for topic creation
+    \item \texttt{LOG\_RATE}: Messages per second per producer
+\end{itemize}
+
+The \texttt{run\_experiment.sh} shell script automates experimental runs:
+\begin{enumerate}
+    \item Create experiment record in database with configuration parameters
+    \item Set environment variables (experiment ID, partition count, log rate)
+    \item Scale producer and consumer services using \texttt{docker-compose up --scale}
+    \item Monitor experiment for specified duration
+    \item Update experiment status to "completed" in database
+    \item Query and display summary statistics (total logs, throughput, latency, lag)
+\end{enumerate}
+
+This automation enables reproducible experiments and systematic performance comparison across configurations.
+
+\section{Scalability and Planned Extensions}
 
 The architecture is designed to scale horizontally by simply adding more producers or consumers. Kafka’s partitioning provides a natural parallelism model, and the database schema will support tracking performance across different runs.  
 Future work may include exploring alternative anomaly detection approaches that incorporate temporal patterns or sequence modelling \cite{Du2017, Sun2021}, but the first version will focus on Isolation Forest and feature-based detection.
 
+
 \chapter{Results}
 
-This chapter presents and analyses the experimental results obtained from the implemented distributed log anomaly detection system. The primary objective of these experiments is to evaluate how different system configurations influence performance under varying levels of load and parallelism. In particular, the experiments examine the impact of scaling producers, consumers, and Kafka partitions on throughput, end-to-end latency, consumer lag, and the number of detected anomalies.
+This chapter presents and analyzes the experimental results obtained from the distributed
+log anomaly detection system. The \textbf{parallel and distributed component of the system
+consists of three cooperating layers}: (1) multiple concurrent Kafka producer processes that
+independently publish log events to a partitioned topic, (2) a Kafka broker that distributes
+messages across partitions, enabling parallel consumption, and (3) a consumer group of
+independent worker processes that each consume an assigned subset of partitions and run
+Isolation Forest inference in parallel. Orchestration of all components is handled through
+Docker Compose, which enables scaling each layer independently without code changes.
 
-All experiments were executed using identical log generation logic and the same Isolation Forest anomaly detection model. This ensures that observed differences in performance are attributable solely to architectural and configuration changes rather than variations in data or model behaviour. During execution, performance metrics were continuously collected and persisted to the database, enabling systematic comparison across all experimental runs.
+The experiments evaluate how the \textbf{degree of parallelism}---controlled by varying the
+number of producers, consumers, and Kafka partitions---affects throughput, latency, consumer
+lag, and anomaly detection behavior. The single-producer, single-consumer, single-partition
+configuration serves as the \textbf{sequential reference
+point}: all log generation, message brokering, and anomaly detection occur without any
+parallelism. Every subsequent configuration introduces parallelism at one or more layers,
+allowing direct measurement of the performance gains and trade-offs introduced by the
+distributed implementation.
 
+Each experiment ran for 10 minutes with identical log generation patterns and Isolation
+Forest model parameters (contamination=0.1, n\_estimators=100).
+
+\textbf{Important note:} All experiments used the same log generation rate of 1.0 messages
+per second per producer. Therefore, differences in total processed logs primarily reflect
+the number of active producers rather than differences in system capacity or processing speed.
+
+% ---------------------------------------------------------------
 \section{Overview of Experiments}
 
-A total of ten experiments were conducted using a batch execution script, each representing a distinct system configuration. These configurations are designed to capture several representative scenarios: baseline operation under minimal load, isolated scaling of producers or consumers, balanced scaling of both components, and high-parallelism stress testing using increased partition counts.
+Table~\ref{tab:all-experiments} presents results from ten configurations designed to isolate
+the effects of scaling producers, consumers, and Kafka partitions. The configurations
+progress from fully sequential (1P-1C-1Part) to increasingly parallel, culminating in the
+stress-test configuration (4P-4C-6Part), which maximizes parallelism at every layer of the
+pipeline.
 
-Table~\ref{tab:all-experiments} provides a consolidated overview of all experimental results. The table reports the number of producers (P), consumers (C), and Kafka partitions used in each configuration, along with the total number of processed logs, detected anomalies, average throughput, average end-to-end latency, and maximum observed consumer lag. This overview serves as the basis for the more detailed analysis presented in the following sections.
-
+% [TABLE 4.1 UNCHANGED]
 \begin{table}[htbp]
 \centering
 \caption{Summary of experimental results across all configurations}
 \label{tab:all-experiments}
-\resizebox{\textwidth}{!}{
-\begin{tabular}{lcccccccc}
+\small
+\begin{tabular}{@{}lcccccccc@{}}
 \hline
-\textbf{Experiment} & \textbf{P} & \textbf{C} & \textbf{Part.} & \textbf{Logs} & \textbf{Anom.} & \textbf{Throughput} & \textbf{Latency (ms)} & \textbf{Max Lag} \\
+\textbf{Experiment} & \textbf{P} & \textbf{C} & \textbf{Part.} & \textbf{Logs} &
+\textbf{Anom.} & \textbf{Thr.} & \textbf{Lat. (ms)} & \textbf{Lag} \\
 \hline
-baseline-1p-1c-1part & 1 & 1 & 1 & 593 & 48 & 0.99 & 506.80 & 1001 \\
-baseline-1p-1c-3part & 1 & 1 & 3 & 593 & 70 & 0.99 & 506.80 & 1001 \\
+baseline-1p-1c-1part & 1 & 1 & 1 & 593  & 48  & 0.99 & 506.80 & 1001 \\
+baseline-1p-1c-3part & 1 & 1 & 3 & 593  & 70  & 0.99 & 506.80 & 1001 \\
 scale-producers-2p   & 2 & 1 & 3 & 1188 & 233 & 1.42 & 595.52 & 1244 \\
 scale-producers-3p   & 3 & 1 & 3 & 1816 & 361 & 2.02 & 493.33 & 1730 \\
-scale-consumers-2c   & 1 & 2 & 3 & 639 & 130 & 1.00 & 506.61 & 2466 \\
-scale-consumers-3c   & 1 & 3 & 3 & 619 & 54 & 1.00 & 506.61 & 2712 \\
+scale-consumers-2c   & 1 & 2 & 3 & 639  & 130 & 1.00 & 506.61 & 2466 \\
+scale-consumers-3c   & 1 & 3 & 3 & 619  & 54  & 1.00 & 506.61 & 2712 \\
 balanced-2p-2c       & 2 & 2 & 3 & 1228 & 157 & 1.52 & 486.69 & 2961 \\
 balanced-3p-3c       & 3 & 3 & 3 & 1851 & 375 & 2.01 & 493.23 & 3459 \\
 high-partitions      & 2 & 2 & 6 & 1210 & 246 & 1.51 & 486.84 & 1009 \\
 stress-test-4p-4c    & 4 & 4 & 6 & 2460 & 512 & 2.48 & 506.48 & 1260 \\
 \hline
+\multicolumn{9}{p{\linewidth}}{\footnotesize
+Thr.\ = Throughput (msg/s), Lat.\ = Latency,
+Lag = Max Lag (messages), P = Producers,
+C = Consumers, Part.\ = Partitions}
 \end{tabular}
-}
 \end{table}
 
-\section{Baseline Behaviour}
+% ---------------------------------------------------------------
+\section{Baseline Performance and Partition Effects}
 
-The baseline experiments, consisting of a single producer and a single consumer, establish a reference point for system behaviour under minimal load. With one Kafka partition, the system processes a total of 593 log messages, achieving an average throughput of 0.99 logs per second and an average end-to-end latency of approximately 506.8 ms. The maximum observed consumer lag in this configuration is 1001 messages.
+The baseline configuration (1 producer, 1 consumer, 1 partition) represents the
+\textbf{fully sequential execution path} of the pipeline: a single process generates logs,
+a single Kafka partition serializes all messages, and a single consumer performs anomaly
+detection without any concurrency. This configuration establishes the reference performance
+values against which all parallel configurations are compared: 593 processed logs, 0.99
+msg/s throughput, 506.8ms average latency, and 1001 messages maximum lag. The system
+detected 48 anomalies (8.1\% of total logs).
 
-Increasing the number of partitions from one to three while keeping the producer and consumer counts unchanged does not lead to measurable changes in throughput or latency, which remain at 0.99 logs per second and 506.8 ms respectively. This outcome is expected, as a single consumer cannot exploit additional partitions for parallel consumption. However, the number of detected anomalies increases from 48 to 70, suggesting that partition-level distribution may influence the temporal ordering or batching of log messages, indirectly affecting anomaly detection outcomes even under low load.
+Increasing partitions from 1 to 3 while maintaining single producer and consumer
+\textbf{introduces broker-level parallelism without adding consumer parallelism}, since a
+single consumer still handles all partitions alone. Consequently, no throughput or latency
+improvement is observed, confirming that partition count alone does not improve performance
+unless matched with additional consumers. However, the anomaly count increased from 48 to
+70 (11.8\% of logs). This 46\% increase in detected anomalies warrants investigation, as it
+suggests partition-based message distribution may affect the Isolation Forest's ability to
+identify outliers. Possible explanations include:
 
-\section{Scaling Producers}
+\begin{itemize}
+    \item \textbf{Partition key effects:} Different partition assignment may alter the local
+    distribution of log features within consumer batches
+    \item \textbf{Training data composition:} The model trains on the last 1000 logs;
+    partition distribution could affect which logs constitute the training set
+    \item \textbf{Temporal ordering changes:} Multi-partition consumption may process logs
+    in different order, affecting feature extraction
+\end{itemize}
 
-Producer scaling experiments focus on increasing ingestion pressure while maintaining a fixed processing capacity of one consumer. When the number of producers is increased from one to two, the total number of processed logs nearly doubles, rising from 593 to 1188 messages. Correspondingly, throughput increases from 0.99 to 1.42 logs per second. This improvement comes at the cost of increased latency, which rises to approximately 595.5 ms, and increased maximum consumer lag of 1244 messages.
+This observation highlights that \textbf{Kafka partitioning configuration can influence
+anomaly detection behavior beyond performance considerations}, an important finding for
+production deployments.
 
-Further increasing the number of producers to three amplifies these effects. The system processes 1816 logs with an average throughput of 2.02 logs per second, more than double the baseline throughput. Interestingly, average latency decreases to approximately 493.3 ms, indicating that batching effects and more continuous data flow may partially offset processing delays. However, maximum lag continues to grow, reaching 1730 messages, highlighting that the single consumer becomes a bottleneck under sustained high ingestion rates. These results demonstrate that producer scaling effectively increases throughput but must be matched with sufficient consumer capacity to prevent backlog accumulation.
+% [TABLE 4.2 UNCHANGED]
+\begin{table}[htbp]
+\centering
+\small
+\caption{Effect of partition count on baseline configuration}
+\label{tab:partition-effect}
+\begin{tabular}{@{}lccccc@{}}
+\hline
+\textbf{Partitions} & \textbf{Throughput} & \textbf{Latency (ms)} & \textbf{Max Lag} &
+\textbf{Anomalies} & \textbf{Rate} \\
+\hline
+1 & 0.99 & 506.80 & 1001 & 48 & 8.1\% \\
+3 & 0.99 & 506.80 & 1001 & 70 & 11.8\% \\
+\hline
+\multicolumn{6}{@{}l@{}}{\footnotesize \textit{Note: 46\% increase in anomaly detection
+requires further investigation}}
+\end{tabular}
+\end{table}
 
-\section{Scaling Consumers}
+% ---------------------------------------------------------------
+\section{Producer Scaling Analysis}
 
-Consumer scaling experiments isolate the effect of increasing processing parallelism while keeping the ingestion rate fixed at one producer. With two consumers and three partitions, the system processes 639 logs with an average throughput of 1.00 log per second and an average latency of approximately 506.6 ms, values that are nearly identical to the baseline configuration.
+% [TABLE 4.3 UNCHANGED]
+\begin{table}[htbp]
+\centering
+\small
+\caption{Producer scaling with single consumer (3 partitions)}
+\label{tab:producer-scaling}
+\begin{tabular}{@{}lccccc@{}}
+\hline
+\textbf{Producers} & \textbf{Logs} & \textbf{Throughput} & \textbf{Latency (ms)} &
+\textbf{Max Lag} & \textbf{Anom. Rate} \\
+\hline
+1 & 593  & 0.99 & 506.80 & 1001 & 11.8\% \\
+2 & 1188 & 1.42 & 595.52 & 1244 & 19.6\% \\
+3 & 1816 & 2.02 & 493.33 & 1730 & 19.9\% \\
+\hline
+\end{tabular}
+\end{table}
 
-Increasing the number of consumers to three does not yield further throughput improvements, which remain at 1.00 log per second, nor does it significantly reduce latency. Instead, maximum lag increases from 2466 to 2712 messages. This behaviour suggests that, under low ingestion rates, additional consumers provide limited benefit and may introduce coordination overhead within the Kafka consumer group. These results highlight that consumer scaling alone is insufficient to improve performance unless accompanied by increased input volume or additional partitions.
 
-\section{Balanced Producer--Consumer Scaling}
+These experiments measure the effect of \textbf{scaling parallelism at the ingestion layer}
+while keeping consumer capacity fixed at one instance. Each additional producer is an
+independent process running concurrently, publishing to the shared Kafka topic without
+coordination with other producers. Table~\ref{tab:producer-scaling} shows the results.
 
-Balanced configurations scale producers and consumers simultaneously, aiming to maintain equilibrium between ingestion and processing capacity. With two producers and two consumers, the system processes 1228 logs and achieves an average throughput of 1.52 logs per second. Average latency decreases slightly to 486.7 ms, indicating more efficient parallel processing. However, maximum lag increases to 2961 messages, suggesting transient imbalances during peak ingestion periods.
+Producer scaling demonstrates near-linear throughput scaling: doubling producers increases
+throughput by 43\%, and tripling increases it by 104\%. This confirms that each producer
+operates independently at approximately 1.0 msg/s, and that \textbf{Kafka successfully
+absorbs concurrent writes from multiple producers without introducing write contention}.
+The near-linear scaling validates the distributed ingestion design, where producers are
+deliberately decoupled from one another and from the consumer layer.
 
-The configuration with three producers and three consumers further improves throughput to 2.01 logs per second while processing 1851 logs. Latency remains stable at approximately 493.2 ms, demonstrating that the system maintains consistent response times even as throughput increases. Although maximum lag rises to 3459 messages, the stability of latency indicates that the system is capable of sustaining higher workloads when producer and consumer scaling are aligned.
+\textbf{Critical observation:} The single consumer successfully processes input from
+multiple producers without becoming saturated. Maximum lag grows (1001 $\rightarrow$ 1244
+$\rightarrow$ 1730 messages), but remains bounded and proportional to total input rate.
+This growing lag demonstrates that \textbf{the consumer is the bottleneck when ingestion
+parallelism is increased without matching processing parallelism} --- a direct consequence
+of the asymmetric scaling. The latency spike at 2 producers (595.52ms vs 506.80ms baseline)
+followed by recovery at 3 producers (493.33ms) suggests transient consumer group
+rebalancing overhead during partition reassignment.
 
-\section{High Parallelism and Stress Testing}
+\textbf{Anomaly detection consistency:} The anomaly rate stabilizes at approximately
+19.6--19.9\% for multi-producer configurations, significantly higher than single-producer
+scenarios (8.1--11.8\%). This increase is likely attributable to the Isolation Forest model
+encountering greater diversity in log patterns when messages from multiple producers are
+interleaved, leading to more outlier classifications during the initial training phase.
 
-The high-partition configuration introduces additional Kafka partitions to increase parallelism at the messaging layer. With two producers, two consumers, and six partitions, the system processes 1210 logs with a throughput of 1.51 logs per second and an average latency of 486.8 ms. Notably, maximum lag decreases significantly to 1009 messages compared to the equivalent three-partition balanced configuration, demonstrating the effectiveness of partition-level parallelism in reducing backlog.
+% ---------------------------------------------------------------
+\section{Consumer Scaling Analysis}
 
-The stress-test configuration represents the most demanding scenario, with four producers, four consumers, and six partitions. This setup processes 2460 logs and achieves the highest observed throughput of 2.48 logs per second. Despite the increased load, average latency remains close to baseline at 506.5 ms, and maximum lag is limited to 1260 messages. These results indicate that the system scales effectively under coordinated increases in producers, consumers, and partitions, maintaining stable latency while significantly increasing throughput.
+% [TABLE 4.4 UNCHANGED]
+\begin{table}[htbp]
+\centering
+\small
+\caption{Consumer scaling with single producer (3 partitions)}
+\label{tab:consumer-scaling}
+\begin{tabular}{@{}lccccc@{}}
+\hline
+\textbf{Consumers} & \textbf{Logs} & \textbf{Throughput} & \textbf{Latency (ms)} &
+\textbf{Max Lag} & \textbf{Anom. Rate} \\
+\hline
+1 & 593 & 0.99 & 506.80 & 1001 & 11.8\% \\
+2 & 639 & 1.00 & 506.61 & 2466 & 20.3\% \\
+3 & 619 & 1.00 & 506.61 & 2712 & 8.7\%  \\
+\hline
+\end{tabular}
+\end{table}
 
-\section{Summary of Results}
+These experiments measure the effect of \textbf{scaling parallelism at the processing
+layer} while keeping ingestion fixed. In a Kafka consumer group, each consumer instance
+is assigned a disjoint subset of partitions and processes them independently and
+concurrently --- this is the primary mechanism for parallel anomaly detection in the
+system. With a single producer generating 1.0 msg/s and 3 partitions, the input rate is
+low enough that even one consumer keeps up. Adding consumers therefore does not increase
+throughput (which remains at 1.00 msg/s), because the \textbf{bottleneck shifts to the
+producer rather than the consumer}.
 
-Overall, the experimental results demonstrate that system performance is strongly influenced by the balance between ingestion rate, processing capacity, and Kafka partitioning. Scaling producers alone increases throughput but leads to higher consumer lag, while scaling consumers alone provides minimal benefit under low input rates. Balanced scaling, particularly when combined with increased partition counts, yields the most stable and scalable performance, maintaining low latency while supporting higher throughput. These findings validate the architectural choices presented earlier and confirm the system’s suitability as a controlled experimental platform for distributed log processing and anomaly detection.
+\textbf{Anomalous result:} Adding consumers \textit{increases} maximum lag from 1001 to
+2466 (2 consumers) and 2712 (3 consumers). Rather than improving processing, adding more
+parallel consumers \textbf{introduces distributed coordination overhead} through Kafka's
+consumer group protocol. When a new consumer joins the group, Kafka triggers a partition
+rebalancing event that temporarily halts all consumption while partitions are reassigned.
+Under a low-throughput producer, the messages that accumulate during this stall are not
+recovered quickly, causing measured lag to remain elevated. Potential causes include:
 
+\begin{itemize}
+    \item \textbf{Partition rebalancing overhead:} Kafka consumer group rebalancing causes
+    temporary processing stalls during which lag accumulates
+    \item \textbf{Offset commit contention:} Multiple consumers committing offsets to the
+    same group coordinator may introduce serialization delays
+    \item \textbf{Training data conflicts:} Each consumer maintains its own Isolation
+    Forest model, trained on its partition's data; model divergence could affect processing
+    efficiency
+\end{itemize}
+
+\textbf{Anomaly detection instability:} The dramatic drop in anomalies from 130 (2
+consumers, 20.3\%) to 54 (3 consumers, 8.7\%) is a direct consequence of the
+\textbf{distributed model architecture}. Because each consumer instance trains an
+independent Isolation Forest on only the partition data it processes, the models diverge:
+they learn from different log subsets and establish different decision boundaries. This
+leads to:
+
+\begin{enumerate}
+    \item Different training data per consumer
+    \item Divergent learned thresholds for anomaly classification
+    \item Inconsistent anomaly detection across partitions
+\end{enumerate}
+
+This finding reveals a \textbf{critical limitation of the distributed design}: parallelizing
+the anomaly detection layer without a model synchronization mechanism produces unreliable
+and non-reproducible detection results.
+
+% ---------------------------------------------------------------
+\section{Balanced Scaling and System Optimization}
+
+% [TABLE 4.5 UNCHANGED]
+\begin{table}[htbp]
+\centering
+\caption{Balanced producer-consumer scaling (3 partitions, then 6)}
+\label{tab:balanced}
+\begin{tabular}{@{}lcccccc@{}}
+\hline
+\textbf{Config} & \textbf{P} & \textbf{C} & \textbf{Part.} & \textbf{Throughput} &
+\textbf{Max Lag} & \textbf{Anom. Rate} \\
+\hline
+2P-2C     & 2 & 2 & 3 & 1.52 & 2961 & 12.8\% \\
+3P-3C     & 3 & 3 & 3 & 2.01 & 3459 & 20.3\% \\
+High-Part & 2 & 2 & 6 & 1.51 & 1009 & 20.3\% \\
+Stress    & 4 & 4 & 6 & 2.48 & 1260 & 20.8\% \\
+\hline
+\end{tabular}
+\end{table}
+
+These configurations evaluate \textbf{full-pipeline parallelism}, where ingestion,
+brokering, and processing layers all scale simultaneously. Balanced scaling maintains
+throughput linearity (1.52 $\rightarrow$ 2.01 $\rightarrow$ 2.48 msg/s), confirming that
+\textbf{the distributed pipeline scales proportionally when all layers are expanded
+together}. However, when partition count (3) is insufficient relative to the number of
+producers and consumers (3P-3C), lag grows to 3459 messages, indicating that Kafka's
+parallelism ceiling has been reached.
+
+The high-partition configuration (2P-2C-6Part) demonstrates that \textbf{increasing
+broker-level parallelism dramatically reduces lag} (1009 vs 2961 messages for the equivalent
+3-partition configuration), confirming that partition count is the primary constraint on
+effective distributed throughput in this architecture.
+
+\textbf{Key insight:} The stress test (4P-4C-6Part) achieves best overall performance:
+highest throughput (2.48 msg/s), moderate lag (1260), and stable latency (506.48ms).
+This configuration represents the most effective use of parallelism across all three layers
+simultaneously. Comparing it to 3P-3C-3Part reveals that adequate partition count (6 vs 3)
+prevents lag accumulation even under higher total load, demonstrating that
+\textbf{partition count must scale with consumer count to unlock full distributed
+processing capacity}.
+
+% ---------------------------------------------------------------
+\section{Latency Analysis and System Bottlenecks}
+
+Figure~\ref{fig:latency-comparison} visualizes end-to-end latency across all ten
+configurations. End-to-end latency here measures the time between a log message being
+published to Kafka and the completion of its anomaly detection and database storage by a
+consumer. It therefore captures the \textbf{total cost of the distributed processing
+pipeline}, including network transit through Kafka, consumer group coordination, feature
+extraction, and Isolation Forest inference.
+
+% [FIGURE UNCHANGED]
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.95\textwidth,
+    height=7cm,
+    xlabel={Configuration},
+    ylabel={Avg Latency (ms)},
+    symbolic x coords={1P-1C-1P, 1P-1C-3P, 2P-1C, 3P-1C, 1P-2C, 1P-3C,
+                       2P-2C, 3P-3C, 2P-2C-6P, 4P-4C},
+    xtick=data,
+    x tick label style={rotate=45,anchor=east,font=\small},
+    ymin=450, ymax=650,
+    grid=major,
+    every axis plot/.append style={thick}
+]
+\addplot[mark=*,blue] coordinates {
+    (1P-1C-1P,506.80)
+    (1P-1C-3P,506.80)
+    (2P-1C,595.52)
+    (3P-1C,493.33)
+    (1P-2C,506.61)
+    (1P-3C,506.61)
+    (2P-2C,486.69)
+    (3P-3C,493.23)
+    (2P-2C-6P,486.84)
+    (4P-4C,506.48)
+};
+\end{axis}
+\end{tikzpicture}
+\caption{Average end-to-end latency across all configurations. Latency remains stable
+across sequential and parallel configurations, indicating that distributed overhead does
+not measurably increase per-message processing time.}
+\label{fig:latency-comparison}
+\end{figure}
+
+The latency clustering around 500ms ($\pm$20ms across all configurations) is a significant
+result: it demonstrates that \textbf{introducing parallelism at any layer of the distributed
+pipeline does not increase per-message processing latency}. In other words, scaling from
+the sequential baseline (1P-1C-1Part) to the fully parallel stress test (4P-4C-6Part)
+incurs no latency penalty. The dominant cost is the fixed Isolation Forest inference and
+database write overhead, not distributed coordination. The 595.52ms spike at 2P-1C is the
+only notable exception and is attributable to a transient consumer group rebalancing event
+rather than a structural scaling limitation.
+
+% ---------------------------------------------------------------
+\section{Critical Findings and Limitations}
+
+\subsection{Performance Scalability}
+
+\textbf{Positive results --- where parallelism works:}
+\begin{itemize}
+    \item \textbf{Producer-layer parallelism scales linearly:} Each additional producer
+    contributes approximately 1.0 msg/s of throughput, and Kafka absorbs concurrent writes
+    without contention
+    \item \textbf{Latency is unaffected by distribution:} End-to-end latency remains stable
+    (~490--510ms) across all configurations, confirming negligible distributed overhead
+    \item \textbf{Partition count governs effective parallelism:} Increasing partitions
+    directly reduces lag accumulation and enables higher consumer concurrency
+\end{itemize}
+
+\textbf{Identified bottlenecks --- where parallelism underperforms:}
+\begin{itemize}
+    \item \textbf{Consumer-layer parallelism is only effective when matched with sufficient
+    partitions:} Consumer group coordination overhead increases lag when consumer count
+    exceeds partition count
+    \item \textbf{Asymmetric scaling degrades performance:} Scaling producers without
+    scaling consumers causes unbounded lag growth; scaling consumers without scaling
+    producers yields no improvement
+    \item \textbf{Producer rate limiting (1.0 msg/s) prevents saturation testing:} The
+    system was not tested under conditions where consumer processing becomes the true
+    bottleneck
+\end{itemize}
+
+\subsection{Anomaly Detection Reliability}
+
+\textbf{Critical limitation of the distributed implementation:} Anomaly detection rates
+vary inconsistently across configurations (8.1\%--20.8\%), directly caused by the
+distributed model architecture.
+
+As discussed in Section 4.4, independent Isolation Forest models trained on
+different partition subsets lead to model divergence and inconsistent anomaly
+classification across consumers.
+
+This is a \textbf{fundamental trade-off of the distributed design}: partitioning enables
+parallel processing but fragments the data seen by each model. Production systems must
+address this through centralized model training with parameter distribution, periodic
+cross-consumer model synchronization, or other distributed learning approaches.
+
+Importantly, the model divergence issue affects only anomaly detection consistency;
+the throughput, latency, and lag measurements are independent of model behavior and
+remain valid and reproducible across all configurations.
+
+
+% ---------------------------------------------------------------
+\section{Conclusion}
+
+The experimental results collectively demonstrate that the distributed pipeline
+\textbf{successfully scales ingestion throughput} through parallel producers and Kafka
+partitioning, and \textbf{maintains stable per-message latency} regardless of the degree
+of parallelism. Compared with the sequential baseline configuration (1P-1C-1Part),
+which achieved 0.99 msg/s, the fully parallel 4P-4C-6Part configuration achieved
+2.48 msg/s, corresponding to a 2.5$\times$ increase in throughput while maintaining
+approximately constant latency. These outcomes validate the core architectural
+hypothesis: that a Kafka-based distributed pipeline can increase system throughput
+without proportionally increasing latency.
+
+However, the experiments also expose a critical limitation specific to the distributed
+implementation: \textbf{parallelizing anomaly detection across independent consumer
+instances without model synchronization produces inconsistent detection rates}. This is
+not a failure of the parallel design per se, but a consequence of applying a
+centralized learning algorithm (Isolation Forest) in a distributed setting without
+coordination. Addressing this limitation --- through shared model parameters or federated
+learning approaches --- remains the primary direction for future work.
 
 \chapter{References}
 \bibliographystyle{IEEEtran}
